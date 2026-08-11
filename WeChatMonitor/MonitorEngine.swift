@@ -262,7 +262,7 @@ final class MonitorEngine: NSObject, ObservableObject {
             if !(self.silencePlayer?.isPlaying ?? false) { self.startSilenceLoop() }
             if !(self.audioEngine?.isRunning ?? false) {
                 // 音频引擎中断后尝试热重启
-                self.audioEngine?.start()
+                try? self.audioEngine?.start()
             }
         }
         RunLoop.main.add(w, forMode: .common)
