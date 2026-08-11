@@ -58,6 +58,28 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
+                if engine.isRunning {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Label("麦克风收音", systemImage: "waveform")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(String(format: "%.0f%%", engine.inputLevel * 100))
+                                .font(.caption.monospacedDigit())
+                                .foregroundColor(engine.inputLevel > 0.02 ? .green : .orange)
+                        }
+                        ProgressView(value: Double(engine.inputLevel))
+                            .tint(engine.inputLevel > 0.02 ? .green : .orange)
+                        Text(engine.inputLevel > 0.02
+                             ? "收音正常：播放收款播报时此处应跳动"
+                             : "收不到声音：检查权限已开、调大音量，再播报测试")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+
                 Button {
                     toggleRun()
                 } label: {

@@ -31,6 +31,7 @@ final class MonitorEngine: NSObject, ObservableObject {
     @Published var detections: [Detection] = []
     @Published var statusText = "未监听"
     @Published var debugLog: [String] = []
+    @Published var inputLevel: Float = 0   // 0~1 实时输入电平
 
     private var audioEngine: AVAudioEngine?
     private var recRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -38,11 +39,11 @@ final class MonitorEngine: NSObject, ObservableObject {
     private var silencePlayer: AVAudioPlayer?
     private var watchdog: Timer?
     private var sessionActive = false
+    private var recognizeErrorCount = 0
 
     // 去重：同一金额 45 秒内只算一笔
     private var dedupAmount: Double = 0
     private var dedupAt: TimeInterval = 0
-    private var pendingCache: String = ""
 
     private var saved: [Detection] {
         get { (try? JSONDecoder().decode([Detection].self, from: UserDefaults.standard.data(forKey: "detections") ?? Data())) ?? [] }
@@ -77,8 +78,8 @@ final class MonitorEngine: NSObject, ObservableObject {
 
         do {
             let session = AVAudioSession.sharedInstance()
-            // playAndRecord：后台音频（静音占位）+ 麦克风采集共存；measurement 模式排除回声消除干扰
-            try session.setCategory(.playAndRecord, mode: .measurement, options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker])
+            // voiceChat：自动增益+回声消除，适合「扬声器播报 → 麦克风收音」场景
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker])
             try session.setActive(true, options: [])
             sessionActive = true
         } catch {
@@ -96,30 +97,76 @@ final class MonitorEngine: NSObject, ObservableObject {
         }
 
         let engine = AVAudioEngine()
+        engine.prepare()
         let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+        let format = inputNode.inputFormat(forBus: 0)
+        addLog("输入格式: \(Int(format.sampleRate))Hz \(format.channelCount)ch")
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         req.taskHint = .dictation
         recRequest = req
 
+        // 规范为 16kHz 单声道，规避 iOS 18 采样率兼容问题
+        let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+        var converter: AVAudioConverter?
+        if abs(format.sampleRate - 16000) > 1 || format.channelCount != 1 {
+            converter = AVAudioConverter(from: format, to: targetFormat)
+        }
+
         recTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self = self else { return }
             if let result = result {
+                self.recognizeErrorCount = 0
                 self.processTranscript(result.bestTranscription.formattedString, final: result.isFinal)
             }
-            if error != nil {
-                self.addLog("识别错误: \(error!.localizedDescription)")
-                // 自动重启识别循环
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if self.isRunning { self.start() }
+            if let e = error as NSError? {
+                let msg = e.localizedDescription
+                self.addLog("识别错误: \(msg)")
+                let delay: TimeInterval
+                if msg.localizedCaseInsensitiveContains("no speech") || msg.localizedCaseInsensitiveContains("no audio") {
+                    self.statusText = "未检测到语音：请调大音量并确认播报"
+                    delay = 3.0
+                } else if msg.localizedCaseInsensitiveContains("denied") || msg.localizedCaseInsensitiveContains("not authorized") {
+                    self.statusText = "语音识别未授权，请到设置开启"
+                    delay = 5.0
+                } else {
+                    self.statusText = "识别中断，自动重试中…"
+                    delay = 1.5
+                }
+                self.recognizeErrorCount += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    if self.isRunning && self.recognizeErrorCount < 6 { self.start() }
                 }
             }
         }
 
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1536, format: format) { [weak self] buffer, _ in
-            self?.recRequest?.append(buffer)
+            guard let self = self else { return }
+            // 实时电平（用于 UI 指示）
+            if let ch = buffer.floatChannelData?[0] {
+                var sum: Float = 0
+                let n = Int(buffer.frameLength)
+                if n > 0 {
+                    for i in 0..<n { let v = ch[i]; sum += v * v }
+                    let rms = sqrt(sum / Float(n))
+                    let level = min(1, rms * 5)
+                    if level > self.inputLevel { self.inputLevel = level } else { self.inputLevel *= 0.75 }
+                }
+            }
+            // 格式转换后送入识别器
+            if let conv = converter, let convBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: buffer.frameCapacity) {
+                var err: NSError?
+                let status = conv.convert(to: convBuf, error: &err) { _, outStatus in
+                    outStatus.pointee = .haveData
+                    return buffer
+                }
+                if status == .haveData && err == nil {
+                    self.recRequest?.append(convBuf)
+                    return
+                }
+            }
+            self.recRequest?.append(buffer)
         }
         do {
             try engine.start()
@@ -145,7 +192,7 @@ final class MonitorEngine: NSObject, ObservableObject {
         audioEngine?.stop()
         audioEngine = nil
         stopSilenceLoop()
-        pendingCache = ""
+        inputLevel = 0
         addLog("已停止监听")
     }
 
@@ -156,11 +203,8 @@ final class MonitorEngine: NSObject, ObservableObject {
     private func processTranscript(_ text: String, final: Bool) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        if final { pendingCache = "" }
-        var buf = pendingCache + t
-        if buf.count > 80 { buf = String(buf.suffix(80)) }
-        pendingCache = buf
-
+        // partial 结果的 formattedString 已是累积全文，直接用即可
+        let buf = t.count > 80 ? String(t.suffix(80)) : t
         guard let amount = parseAmount(buf) else { return }
         let now = Date().timeIntervalSince1970
         if abs(amount - dedupAmount) < 0.001 && now - dedupAt < 45 { return }
@@ -257,7 +301,7 @@ final class MonitorEngine: NSObject, ObservableObject {
     }
 
     private func startWatchdog() {
-        let w = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
+        let w = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             if !(self.silencePlayer?.isPlaying ?? false) { self.startSilenceLoop() }
             if !(self.audioEngine?.isRunning ?? false) {
