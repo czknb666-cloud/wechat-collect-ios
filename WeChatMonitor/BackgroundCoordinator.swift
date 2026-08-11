@@ -25,7 +25,9 @@ final class BGTaskCoordinator {
 
     private func handle(task: BGTask) {
         scheduleRefresh()
-        MonitorEngine.shared.refreshOnForeground()
+        DispatchQueue.main.async {
+            MonitorEngine.shared.refreshOnForeground()
+        }
         task.setTaskCompleted(success: true)
     }
 }

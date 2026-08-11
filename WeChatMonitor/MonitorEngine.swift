@@ -115,27 +115,30 @@ final class MonitorEngine: NSObject, ObservableObject {
 
         recTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self = self else { return }
-            if let result = result {
-                self.recognizeErrorCount = 0
-                self.processTranscript(result.bestTranscription.formattedString, final: result.isFinal)
-            }
-            if let e = error as NSError? {
-                let msg = e.localizedDescription
-                self.addLog("识别错误: \(msg)")
-                let delay: TimeInterval
-                if msg.localizedCaseInsensitiveContains("no speech") || msg.localizedCaseInsensitiveContains("no audio") {
-                    self.statusText = "未检测到语音：请调大音量并确认播报"
-                    delay = 3.0
-                } else if msg.localizedCaseInsensitiveContains("denied") || msg.localizedCaseInsensitiveContains("not authorized") {
-                    self.statusText = "语音识别未授权，请到设置开启"
-                    delay = 5.0
-                } else {
-                    self.statusText = "识别中断，自动重试中…"
-                    delay = 1.5
+            DispatchQueue.main.async {
+                guard self.isRunning || result?.isFinal == true else { return }
+                if let result = result {
+                    self.recognizeErrorCount = 0
+                    self.processTranscript(result.bestTranscription.formattedString, final: result.isFinal)
                 }
-                self.recognizeErrorCount += 1
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                    if self.isRunning && self.recognizeErrorCount < 6 { self.start() }
+                if let e = error as NSError? {
+                    let msg = e.localizedDescription
+                    self.addLog("识别错误: \(msg)")
+                    let delay: TimeInterval
+                    if msg.localizedCaseInsensitiveContains("no speech") || msg.localizedCaseInsensitiveContains("no audio") {
+                        self.statusText = "未检测到语音：请调大音量并确认播报"
+                        delay = 3.0
+                    } else if msg.localizedCaseInsensitiveContains("denied") || msg.localizedCaseInsensitiveContains("not authorized") {
+                        self.statusText = "语音识别未授权，请到设置开启"
+                        delay = 5.0
+                    } else {
+                        self.statusText = "识别中断，自动重试中…"
+                        delay = 1.5
+                    }
+                    self.recognizeErrorCount += 1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        if self.isRunning && self.recognizeErrorCount < 6 { self.start() }
+                    }
                 }
             }
         }
@@ -143,7 +146,7 @@ final class MonitorEngine: NSObject, ObservableObject {
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1536, format: format) { [weak self] buffer, _ in
             guard let self = self else { return }
-            // 实时电平（用于 UI 指示）
+            // 实时电平（仅显著变化时切主线程更新，避免高频调度）
             if let ch = buffer.floatChannelData?[0] {
                 var sum: Float = 0
                 let n = Int(buffer.frameLength)
@@ -151,7 +154,12 @@ final class MonitorEngine: NSObject, ObservableObject {
                     for i in 0..<n { let v = ch[i]; sum += v * v }
                     let rms = sqrt(sum / Float(n))
                     let level = min(1, rms * 5)
-                    if level > self.inputLevel { self.inputLevel = level } else { self.inputLevel *= 0.75 }
+                    let smoothed = max(level, self.inputLevel * 0.75)
+                    if abs(smoothed - self.inputLevel) > 0.005 {
+                        DispatchQueue.main.async {
+                            self.inputLevel = smoothed
+                        }
+                    }
                 }
             }
             // 格式转换后送入识别器
@@ -255,13 +263,17 @@ final class MonitorEngine: NSObject, ObservableObject {
         Task {
             do {
                 try await APIClient.shared.reportDetect(amount: det.amount)
-                if let idx = detections.firstIndex(where: { $0.id == det.id }) {
-                    detections[idx].uploaded = true
-                    saved = detections
+                DispatchQueue.main.async {
+                    if let idx = self.detections.firstIndex(where: { $0.id == det.id }) {
+                        self.detections[idx].uploaded = true
+                        self.saved = self.detections
+                    }
+                    self.addLog("已上报 \(det.amountText())")
                 }
-                addLog("已上报 \(det.amountText())")
             } catch {
-                addLog("上报失败: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self.addLog("上报失败: \(error.localizedDescription)")
+                }
             }
         }
     }
@@ -353,10 +365,12 @@ final class MonitorEngine: NSObject, ObservableObject {
     func history() -> [Detection] { detections }
 
     func markVerified(_ id: UUID, ok: Bool, note: String) {
-        if let idx = detections.firstIndex(where: { $0.id == id }) {
-            detections[idx].verified = ok
-            detections[idx].verifyNote = note
-            saved = detections
+        DispatchQueue.main.async {
+            if let idx = self.detections.firstIndex(where: { $0.id == id }) {
+                self.detections[idx].verified = ok
+                self.detections[idx].verifyNote = note
+                self.saved = self.detections
+            }
         }
     }
 
