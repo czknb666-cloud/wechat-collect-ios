@@ -20,7 +20,8 @@ struct Detection: Identifiable, Codable {
 }
 
 /// 核心引擎：后台音频保活 + 麦克风采集 + 语音识别「微信收款到账播报」
-final class MonitorEngine: NSObject, ObservableObject {
+/// 采集优先 AVAudioEngine，失败自动降级 AVCaptureSession（兼容容器环境）
+final class MonitorEngine: NSObject, ObservableObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     static let shared = MonitorEngine()
 
     // UI 状态
@@ -40,6 +41,16 @@ final class MonitorEngine: NSObject, ObservableObject {
     private var watchdog: Timer?
     private var sessionActive = false
     private var recognizeErrorCount = 0
+
+    // AVCapture 降级模式
+    private var captureSession: AVCaptureSession?
+    private var captureQueue: DispatchQueue?
+
+    // 动态格式转换器（输入格式与 16k 单声道不同时才创建）
+    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private var inputConverter: AVAudioConverter?
+    private var converterFromRate: Double = 0
+    private var converterFromChannels: AVAudioChannelCount = 0
 
     // 去重：同一金额 45 秒内只算一笔
     private var dedupAmount: Double = 0
@@ -76,6 +87,12 @@ final class MonitorEngine: NSObject, ObservableObject {
         stop()
         requestPermissions()
 
+        if !AVAudioSession.sharedInstance().isInputAvailable {
+            addLog("麦克风输入不可用（检查权限或运行环境）")
+            statusText = "麦克风不可用"
+            return false
+        }
+
         do {
             let session = AVAudioSession.sharedInstance()
             // voiceChat：自动增益+回声消除，适合「扬声器播报 → 麦克风收音」场景
@@ -96,22 +113,10 @@ final class MonitorEngine: NSObject, ObservableObject {
             return false
         }
 
-        let engine = AVAudioEngine()
-        engine.prepare()
-        let inputNode = engine.inputNode
-        let format = inputNode.inputFormat(forBus: 0)
-        addLog("输入格式: \(Int(format.sampleRate))Hz \(format.channelCount)ch")
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         req.taskHint = .dictation
         recRequest = req
-
-        // 规范为 16kHz 单声道，规避 iOS 18 采样率兼容问题
-        let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-        var converter: AVAudioConverter?
-        if abs(format.sampleRate - 16000) > 1 || format.channelCount != 1 {
-            converter = AVAudioConverter(from: format, to: targetFormat)
-        }
 
         recTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self = self else { return }
@@ -143,50 +148,75 @@ final class MonitorEngine: NSObject, ObservableObject {
             }
         }
 
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1536, format: format) { [weak self] buffer, _ in
-            guard let self = self else { return }
-            // 实时电平（仅显著变化时切主线程更新，避免高频调度）
-            if let ch = buffer.floatChannelData?[0] {
-                var sum: Float = 0
-                let n = Int(buffer.frameLength)
-                if n > 0 {
-                    for i in 0..<n { let v = ch[i]; sum += v * v }
-                    let rms = sqrt(sum / Float(n))
-                    let level = min(1, rms * 5)
-                    let smoothed = max(level, self.inputLevel * 0.75)
-                    if abs(smoothed - self.inputLevel) > 0.005 {
-                        DispatchQueue.main.async {
-                            self.inputLevel = smoothed
-                        }
-                    }
-                }
-            }
-            // 格式转换后送入识别器
-            if let conv = converter, let convBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: buffer.frameCapacity) {
-                var err: NSError?
-                let status = conv.convert(to: convBuf, error: &err) { _, outStatus in
-                    outStatus.pointee = .haveData
-                    return buffer
-                }
-                if status == .haveData && err == nil {
-                    self.recRequest?.append(convBuf)
-                    return
-                }
-            }
-            self.recRequest?.append(buffer)
-        }
-        do {
-            try engine.start()
-        } catch {
-            addLog("引擎启动失败: \(error.localizedDescription)")
+        // 引擎优先，失败降级到采集模式
+        if !startAudioEngineInput() && !startCaptureInput() {
+            recTask?.cancel(); recTask = nil
+            recRequest?.endAudio(); recRequest = nil
+            statusText = "无法启动录音"
+            addLog("所有录音通道均启动失败")
             return false
         }
-        audioEngine = engine
+
         isRunning = true
         statusText = "监听中 · 等待到账播报"
         addLog("开始监听")
         startWatchdog()
+        return true
+    }
+
+    /// AVAudioEngine 录音通道（容器环境下可能不可用）
+    private func startAudioEngineInput() -> Bool {
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+        let format = inputNode.inputFormat(forBus: 0)
+        addLog("引擎输入: \(Int(format.sampleRate))Hz \(format.channelCount)ch")
+        inputNode.removeTap(onBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1536, format: format) { [weak self] buffer, _ in
+            self?.handleAudioBuffer(buffer)
+        }
+        do {
+            engine.prepare()
+            try engine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            addLog("引擎启动失败: \(error.localizedDescription)")
+            return false
+        }
+        audioEngine = engine
+        return true
+    }
+
+    /// AVCaptureSession 录音通道（容器/异常环境下更可靠）
+    private func startCaptureInput() -> Bool {
+        guard let device = AVCaptureDevice.default(for: .audio) else {
+            addLog("无音频采集设备")
+            return false
+        }
+        guard let devInput = try? AVCaptureDeviceInput(device: device) else {
+            addLog("无法打开采集设备")
+            return false
+        }
+        let session = AVCaptureSession()
+        guard session.canAddInput(devInput) else {
+            addLog("采集会话无法添加输入")
+            return false
+        }
+        session.addInput(devInput)
+        let out = AVCaptureAudioDataOutput()
+        captureQueue = DispatchQueue(label: "monitor.capture.audio")
+        out.setSampleBufferDelegate(self, queue: captureQueue)
+        guard session.canAddOutput(out) else {
+            addLog("采集会话无法添加输出")
+            return false
+        }
+        session.addOutput(out)
+        session.startRunning()
+        guard session.isRunning else {
+            addLog("采集会话启动失败")
+            return false
+        }
+        captureSession = session
+        addLog("录音通道：AVCapture 采集模式")
         return true
     }
 
@@ -199,9 +229,90 @@ final class MonitorEngine: NSObject, ObservableObject {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
+        captureSession?.stopRunning()
+        captureSession = nil
+        captureQueue = nil
+        inputConverter = nil
         stopSilenceLoop()
         inputLevel = 0
         addLog("已停止监听")
+    }
+
+    // MARK: - 音频数据统一入口
+
+    private func handleAudioBuffer(_ buffer: AVAudioPCMBuffer) {
+        updateLevel(buffer)
+        appendToRecognizer(buffer)
+    }
+
+    private func updateLevel(_ buffer: AVAudioPCMBuffer) {
+        guard let ch = buffer.floatChannelData?[0] else { return }
+        let n = Int(buffer.frameLength)
+        guard n > 0 else { return }
+        var sum: Float = 0
+        for i in 0..<n { let v = ch[i]; sum += v * v }
+        let rms = sqrt(sum / Float(n))
+        let level = min(1, rms * 5)
+        let smoothed = max(level, inputLevel * 0.75)
+        if abs(smoothed - inputLevel) > 0.005 {
+            DispatchQueue.main.async { self.inputLevel = smoothed }
+        }
+    }
+
+    /// 动态建转换器，统一为 16kHz 单声道送入识别器
+    private func appendToRecognizer(_ buffer: AVAudioPCMBuffer) {
+        let fmt = buffer.format
+        if inputConverter == nil || converterFromRate != fmt.sampleRate || converterFromChannels != fmt.channelCount {
+            if abs(fmt.sampleRate - 16000) > 1 || fmt.channelCount != 1 {
+                inputConverter = AVAudioConverter(from: fmt, to: targetFormat)
+                converterFromRate = fmt.sampleRate
+                converterFromChannels = fmt.channelCount
+            } else {
+                inputConverter = nil
+            }
+        }
+        if let conv = inputConverter, let convBuf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: buffer.frameCapacity) {
+            var err: NSError?
+            let status = conv.convert(to: convBuf, error: &err) { _, outStatus in
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            if status == .haveData && err == nil && convBuf.frameLength > 0 {
+                recRequest?.append(convBuf)
+                return
+            }
+        }
+        recRequest?.append(buffer)
+    }
+
+    // MARK: - AVCaptureAudioDataOutputSampleBufferDelegate
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard recRequest != nil,
+              let fmt = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) else { return }
+        var asbd = asbdPtr.pointee
+        guard let audioFormat = AVAudioFormat(streamDescription: &asbd),
+              let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        let length = CMBlockBufferGetDataLength(blockBuffer)
+        guard length > 0, asbd.mBytesPerFrame > 0 else { return }
+        let frames = AVAudioFrameCount(length) / AVAudioFrameCount(asbd.mBytesPerFrame)
+        guard frames > 0, let pcm = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frames) else { return }
+        pcm.frameLength = frames
+        var dataPointer: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(blockBuffer, 0, nil, nil, &dataPointer) == kCMBlockBufferNoErr,
+              let ptr = dataPointer else { return }
+        if let abl = pcm.mutableAudioBufferList {
+            let bufList = UnsafeMutableAudioBufferListPointer(abl)
+            for i in 0..<Int(bufList.count) {
+                let off = Int(bufList[i].mDataByteOffset)
+                let size = Int(bufList[i].mDataByteSize)
+                if let d = bufList[i].mData, off + size <= length {
+                    d.copyMemory(from: ptr.advanced(by: off), byteCount: size)
+                }
+            }
+        }
+        handleAudioBuffer(pcm)
     }
 
     // MARK: - 语音解析
@@ -316,9 +427,9 @@ final class MonitorEngine: NSObject, ObservableObject {
         let w = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             if !(self.silencePlayer?.isPlaying ?? false) { self.startSilenceLoop() }
-            if !(self.audioEngine?.isRunning ?? false) {
-                // 音频引擎中断后尝试热重启
-                try? self.audioEngine?.start()
+            if let eng = self.audioEngine, !eng.isRunning {
+                // 引擎中断后尝试热重启
+                try? eng.start()
             }
         }
         RunLoop.main.add(w, forMode: .common)
