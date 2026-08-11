@@ -79,7 +79,7 @@ final class APIClient {
 
     /// 绑定码换长期令牌
     func bind(code: String) async throws -> BindResponse {
-        try await request("/api/app/bind", method: "POST", body: [
+        try await request("/app/bind", method: "POST", body: [
             "code": code,
             "deviceName": UIDevice.current.name,
         ], as: BindResponse.self)
@@ -88,16 +88,16 @@ final class APIClient {
     /// 上报检测到的收款金额
     func reportDetect(amount: Double) async throws {
         struct R: Decodable { let ok: Bool }
-        _ = try await request("/api/recharge/detect", method: "POST", body: ["amount": amount, "source": "voice"], auth: true, as: R.self)
+        _ = try await request("/recharge/detect", method: "POST", body: ["amount": amount, "source": "voice"], auth: true, as: R.self)
     }
 
     /// 用微信支付单号核销待审核充值单
     func verify(serial: String) async throws -> VerifyResponse {
-        try await request("/api/recharge/verify", method: "POST", body: ["serial": serial], auth: true, as: VerifyResponse.self)
+        try await request("/recharge/verify", method: "POST", body: ["serial": serial], auth: true, as: VerifyResponse.self)
     }
 
     /// 校验当前令牌有效性
     func profile() async throws -> ProfileResponse {
-        try await request("/api/user/profile", method: "GET", auth: true, as: ProfileResponse.self)
+        try await request("/user/profile", method: "GET", auth: true, as: ProfileResponse.self)
     }
 }
