@@ -1,0 +1,45 @@
+name: iOS Build (IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build unsigned app
+        run: |
+          xcodebuild \
+            -project WeChatMonitor.xcodeproj \
+            -target WeChatMonitor \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA (unsigned, for Sideloadly)
+        run: |
+          set -e
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/收款监控.app" "Payload/"
+          zip -qry WeChatMonitor.ipa Payload
+          ls -lh WeChatMonitor.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatMonitor-ipa
+          path: WeChatMonitor.ipa
+          retention-days: 7
